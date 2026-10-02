@@ -760,6 +760,7 @@ def validate_source_artifact(
     arch: str = "universal",
     verify_signature: bool = True,
     verify_sha256: bool = True,
+    allow_merged_play_apk: bool = False,
 ) -> tuple[bool, list[str]]:
     """Validate an artifact against the patch source's declared target contract.
 
@@ -850,6 +851,11 @@ def validate_source_artifact(
                 or actual_type in normalized_allowed
                 or ("APK" in normalized_allowed and actual_type in {"APK", *bundle_types})
                 or ("XAPK" in normalized_allowed and actual_type in bundle_types)
+                # Google Play App Bundles are downloaded as split APKs and
+                # merged by gplaydl/APKEditor into a standalone APK. This is
+                # intentionally opt-in so a source that requires XAPK does
+                # not generally start accepting arbitrary APKs.
+                or (allow_merged_play_apk and actual_type == "APK" and "XAPK" in normalized_allowed)
             )
             if not type_compatible:
                 reasons.append(
