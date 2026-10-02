@@ -1,0 +1,6 @@
+boto3
+PyGithub
+beautifulsoup4
+curl-cffi
+requests
+gplaydl==4.2.1

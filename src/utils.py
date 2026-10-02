@@ -1,0 +1,1204 @@
+import json
+import hashlib
+import os
+import re
+import shutil
+import time
+import logging
+import tempfile
+import zipfile
+from typing import List, Optional
+from github.GithubException import BadCredentialsException
+from src import gh
+from sys import exit
+import subprocess
+from pathlib import Path
+from urllib.parse import urlparse, unquote, parse_qs, quote
+from src import session
+
+def _parseparam(s):
+    while s[:1] == ";":
+        s = s[1:]
+        end = s.find(";")
+        while end > 0 and (s.count('"', 0, end) - s.count('\\"', 0, end)) % 2:
+            end = s.find(";", end + 1)
+        if end < 0:
+            end = len(s)
+        f = s[:end]
+        yield f.strip()
+        s = s[end:]
+
+
+def parse_header(line):
+    """Parse a Content-type like header.
+    Return the main content-type and a dictionary of options.
+    """
+    parts = _parseparam(";" + line)
+    key = parts.__next__()
+    pdict = {}
+    for p in parts:
+        i = p.find("=")
+        if i >= 0:
+            name = p[:i].strip().lower()
+            value = p[i + 1 :].strip()
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
+                value = value.replace("\\\\", "\\").replace('\\"', '"')
+            pdict[name] = value
+    return key, pdict
+
+def find_file(files: list[Path], prefix: str = None, suffix: str = None, contains: str = None, exclude: list = None) -> Path | None:
+    """Find a file with various matching criteria"""
+    if exclude is None:
+        exclude = []
+    
+    for file in files:
+        # Skip excluded patterns
+        if any(excl.lower() in file.name.lower() for excl in exclude):
+            continue
+            
+        # Check all criteria
+        matches = True
+        
+        if prefix and not file.name.startswith(prefix):
+            matches = False
+            
+        if suffix:
+            suff_tuple = tuple(suffix) if isinstance(suffix, (list, tuple)) else suffix
+            if not file.name.endswith(suff_tuple):
+                matches = False
+            
+        if contains and contains.lower() not in file.name.lower():
+            matches = False
+            
+        if matches:
+            return file
+    
+    # If not found with exclude, try without exclude (for fallback)
+    if exclude:
+        for file in files:
+            matches = True
+            
+            if prefix and not file.name.startswith(prefix):
+                matches = False
+                
+            if suffix and not file.name.endswith(suffix):
+                matches = False
+                
+            if contains and contains.lower() not in file.name.lower():
+                matches = False
+                
+            if matches:
+                return file
+    
+    return None
+
+def find_apksigner() -> str | None:
+    on_path = shutil.which("apksigner")
+    if on_path:
+        return on_path
+
+    sdk_roots = [
+        "/usr/local/lib/android/sdk",  # GitHub Actions runner default
+        os.environ.get("ANDROID_HOME"),
+        os.environ.get("ANDROID_SDK_ROOT"),
+    ]
+
+    for root in sdk_roots:
+        if not root:
+            continue
+        build_tools_dir = Path(root) / "build-tools"
+        if not build_tools_dir.exists():
+            continue
+        versions = sorted(build_tools_dir.iterdir(), reverse=True)
+        for version_dir in versions:
+            apksigner_path = version_dir / "apksigner"
+            if apksigner_path.exists() and apksigner_path.is_file():
+                return str(apksigner_path)
+
+    logging.error(
+        "No apksigner found. Install Android SDK build-tools and either put "
+        "apksigner on PATH or set ANDROID_HOME/ANDROID_SDK_ROOT."
+    )
+    return None
+
+def run_process(
+    command: List[str],
+    cwd: Optional[Path] = None,
+    capture: bool = False,
+    stream: bool = False,
+    silent: bool = False,
+    check: bool = True,
+    shell: bool = False
+) -> Optional[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        shell=shell
+    )
+
+    output_lines = []
+
+    try:
+        for line in iter(process.stdout.readline, ''):
+            if line:
+                if not silent:
+                    print(line.rstrip(), flush=True)
+                if capture:
+                    output_lines.append(line)
+        process.stdout.close()
+        return_code = process.wait()
+
+        output = ''.join(output_lines).strip() if capture else None
+
+        if check and return_code != 0:
+            # Include captured output so callers can diagnose and optionally retry.
+            raise subprocess.CalledProcessError(return_code, command, output=output)
+
+        return output
+
+    except FileNotFoundError as e:
+        # Let callers handle this (e.g., fallback to another tool).
+        raise e
+    except Exception as e:
+        # Do not exit() here; callers (workflow) may want to retry with a different
+        # version/source or emit a clearer error message.
+        raise e
+
+def normalize_version(version: str) -> list[int]:
+    parts = version.split('.')
+    normalized = []
+    for part in parts:
+        match = re.match(r'(\d+)', part)
+        if match:
+            normalized.append(int(match.group(1)))
+        else:
+            normalized.append(0)
+    
+    # Include build number in comparison for versions like "6.6 build 002"
+    build_match = re.search(r'build\s+(\d+)', version, re.IGNORECASE)
+    if build_match:
+        normalized.append(int(build_match.group(1)))
+    
+    # Also check for parentheses format like "32.30.0(1575420)"
+    paren_match = re.search(r'\((\d+)\)$', version)
+    if paren_match:
+        normalized.append(int(paren_match.group(1)))
+    
+    return normalized
+
+def get_highest_version(versions: list[str]) -> str | None:
+    if not versions:
+        return None
+    highest_version = versions[0]
+    for v in versions[1:]:
+        if normalize_version(v) > normalize_version(highest_version):
+            highest_version = v
+    return highest_version
+
+def select_preferred_patch_targets(targets: list[dict]) -> list[dict]:
+    """Select automatic patch targets and retain every declared source constraint."""
+    by_version: dict[str, dict] = {}
+
+    for target in targets or []:
+        if not isinstance(target, dict):
+            continue
+        version = str(target.get("version") or "").strip()
+        if not version:
+            continue
+
+        entry = by_version.setdefault(version, {
+            "version_codes": [],
+            "version_codes_by_arch": {},
+            "experimental_flags": set(),
+            "min_sdks": set(),
+            "signatures": set(),
+            "apk_file_types": set(),
+            "sha256": set(),
+            "abis": set(),
+            "dpis": set(),
+        })
+
+        flag = target.get("is_experimental")
+        if flag is None and "isExperimental" in target:
+            flag = target.get("isExperimental")
+        entry["experimental_flags"].add(flag if isinstance(flag, bool) else None)
+
+        raw_codes_by_arch = target.get("version_codes_by_arch")
+        if isinstance(raw_codes_by_arch, dict):
+            for arch_name, values in raw_codes_by_arch.items():
+                values = values if isinstance(values, list) else [values]
+                for item in values:
+                    if isinstance(item, (int, float)) and int(item) > 0:
+                        code = int(item)
+                    elif isinstance(item, str) and item.isdigit():
+                        code = int(item)
+                    else:
+                        continue
+                    arch_key = str(arch_name).upper()
+                    entry["version_codes_by_arch"].setdefault(arch_key, [])
+                    if code not in entry["version_codes_by_arch"][arch_key]:
+                        entry["version_codes_by_arch"][arch_key].append(code)
+                    if code not in entry["version_codes"]:
+                        entry["version_codes"].append(code)
+
+        raw_codes = target.get("version_codes")
+        if raw_codes is None:
+            raw_codes = target.get("versionCodes")
+        if isinstance(raw_codes, dict):
+            for arch_name, value in raw_codes.items():
+                values = value if isinstance(value, list) else [value]
+                for item in values:
+                    if isinstance(item, (int, float)) and int(item) > 0:
+                        code = int(item)
+                    elif isinstance(item, str) and item.isdigit():
+                        code = int(item)
+                    else:
+                        continue
+                    arch_key = str(arch_name).upper()
+                    entry["version_codes_by_arch"].setdefault(arch_key, [])
+                    if code not in entry["version_codes_by_arch"][arch_key]:
+                        entry["version_codes_by_arch"][arch_key].append(code)
+                    if code not in entry["version_codes"]:
+                        entry["version_codes"].append(code)
+        else:
+            values = raw_codes if isinstance(raw_codes, list) else [raw_codes]
+            for value in values:
+                if isinstance(value, (int, float)) and int(value) > 0:
+                    code = int(value)
+                elif isinstance(value, str) and value.isdigit():
+                    code = int(value)
+                else:
+                    continue
+                if code not in entry["version_codes"]:
+                    entry["version_codes"].append(code)
+
+        min_sdk = target.get("min_sdk")
+        if min_sdk is None:
+            min_sdk = target.get("minSdk")
+        if isinstance(min_sdk, (int, float)) and int(min_sdk) > 0:
+            entry["min_sdks"].add(int(min_sdk))
+
+        def metadata_values(value):
+            if value is None:
+                return []
+            return value if isinstance(value, (list, tuple, set)) else [value]
+
+        for value in metadata_values(target.get("signatures")):
+            value = str(value).strip().lower()
+            if value:
+                entry["signatures"].add(value)
+
+        for value in metadata_values(
+            target.get("apk_file_types") or target.get("apkFileTypes")
+        ):
+            value = str(value).strip().upper()
+            if value:
+                entry["apk_file_types"].add(value)
+
+        for value in metadata_values(target.get("sha256") or target.get("sha256s")):
+            value = str(value).strip().lower()
+            if value:
+                entry["sha256"].add(value)
+
+        for value in metadata_values(target.get("abis") or target.get("abi")):
+            value = str(value).strip().lower()
+            if value:
+                entry["abis"].add(value)
+
+        for value in metadata_values(target.get("dpis") or target.get("dpi")):
+            value = str(value).strip().lower()
+            if value:
+                entry["dpis"].add(value)
+
+    stable_versions = {
+        version for version, entry in by_version.items()
+        if entry["experimental_flags"] == {False}
+    }
+    selected_versions = stable_versions if stable_versions else set(by_version)
+
+    selected = []
+    for version in selected_versions:
+        entry = by_version[version]
+        item = {
+            "version": version,
+            "version_codes": sorted(set(entry["version_codes"])),
+            "is_experimental": version not in stable_versions,
+        }
+        if entry["version_codes_by_arch"]:
+            item["version_codes_by_arch"] = {
+                arch: sorted(set(codes))
+                for arch, codes in entry["version_codes_by_arch"].items()
+            }
+        if entry["min_sdks"]:
+            item["min_sdk"] = max(entry["min_sdks"])
+        if entry["signatures"]:
+            item["signatures"] = sorted(entry["signatures"])
+        if entry["apk_file_types"]:
+            item["apk_file_types"] = sorted(entry["apk_file_types"])
+        if entry["sha256"]:
+            item["sha256"] = sorted(entry["sha256"])
+        if entry["abis"]:
+            item["abis"] = sorted(entry["abis"])
+        if entry["dpis"]:
+            item["dpis"] = sorted(entry["dpis"])
+        selected.append(item)
+
+    selected.sort(key=lambda target: normalize_version(target["version"]), reverse=True)
+    return selected
+
+def get_supported_versions(package_name: str, cli: str, patches: str) -> list[str]:
+    # Morphe CLI and ReVanced CLI have different list-versions syntax
+    cli_name = Path(cli).name.lower()
+    is_morphe_cli = 'morphe' in cli_name
+    is_revanced_v6_or_newer = 'revanced-cli-6' in cli_name or 'revanced-cli-7' in cli_name or 'revanced-cli-8' in cli_name
+
+    if is_morphe_cli:
+        # Morphe CLI docs officially describe `list-patches --with-packages --with-versions`
+        # (and the output tends to include more complete version information than
+        # `list-versions`, which may only show "most common" compatible versions).
+        #
+        # We still try `list-versions` first because it's lighter, but if it
+        # yields too little info we fall back to parsing `list-patches`.
+        cmd = [
+            'java', '-jar', cli,
+            'list-versions',
+            '-f', package_name,
+            '--patches', patches
+        ]
+    elif is_revanced_v6_or_newer:
+        cmd = [
+            'java', '-jar', cli,
+            'list-versions',
+            '-p', patches, '-b',
+            '-f', package_name
+        ]
+    else:
+        # ReVanced CLI: pass patches as positional arg
+        cmd = [
+            'java', '-jar', cli,
+            'list-versions',
+            '-f', package_name,
+            patches
+        ]
+
+    # We want the raw output even if the CLI returns a non-zero exit code (bad
+    # args, missing patches, etc.) so we can decide what to do.
+    output = run_process(cmd, capture=True, silent=True, check=False)
+
+    if not output:
+        logging.warning("No output returned from list-versions command")
+        return []
+
+    lines = output.splitlines()
+    logging.info(f"CLI raw output lines: {lines}")
+
+    # Detect CLI error/usage output (wrong syntax, unrecognized args, etc.)
+    first_line = lines[0].strip().lower()
+    if 'usage:' in first_line or 'unmatched argument' in first_line or 'error' in first_line:
+        logging.warning(f"CLI returned error/usage output, cannot determine version")
+        return []
+
+    if len(lines) <= 2:
+        logging.warning("Output has no version lines")
+        return []
+
+    versions = []
+    for line in lines[2:]:
+        line = line.strip()
+        if line and 'Any' not in line:
+            # Parse version - may include "build XXX" suffix
+            # Format: "6.6 build 002" or "32.30.0(1575420)" or just "6.6"
+            parts = line.split()
+            if parts:
+                version = parts[0]
+                # Validate it looks like a version (starts with a digit)
+                if not version[0].isdigit():
+                    continue
+                # Check if next parts are "build XXX"
+                if len(parts) >= 3 and parts[1].lower() == 'build':
+                    version = f"{parts[0]} build {parts[2]}"
+                versions.append(version)
+
+    # If Morphe CLI only returned a tiny "most common" list (or nothing),
+    # attempt to derive a fuller candidate set from `list-patches`.
+    if is_morphe_cli and len(versions) <= 1:
+        try:
+            alt_cmd = [
+                "java", "-jar", cli,
+                "list-patches",
+                "--with-packages",
+                "--with-versions",
+                patches,
+            ]
+            alt_out = run_process(alt_cmd, capture=True, silent=True, check=False) or ""
+            derived: list[str] = []
+            for ln in alt_out.splitlines():
+                if package_name not in ln:
+                    continue
+                # Grab any versions mentioned on the same line as the package name.
+                for m in re.finditer(r"\d+(?:\.\d+)+(?:\(\d+\))?", ln):
+                    derived.append(m.group(0))
+            if derived:
+                versions.extend(derived)
+        except Exception:
+            pass
+
+    if not versions:
+        logging.warning("No supported versions found")
+        return []
+
+    # Sort highest -> lowest.
+    versions = sorted(set(versions), key=normalize_version, reverse=True)
+    logging.info(f"CLI parsed versions: {versions}")
+    return versions
+
+
+# Cache patch-target metadata because one automatic build can traverse
+# several download providers for the same app/source.
+_source_supported_targets_cache = {}
+
+
+def get_source_supported_targets(package_name: str, source: str) -> list[dict]:
+    """Read and normalize the exact target contract published by a patch source."""
+    if not package_name or not source:
+        return []
+
+    cache_key = (package_name, source)
+    if cache_key in _source_supported_targets_cache:
+        return list(_source_supported_targets_cache[cache_key])
+
+    try:
+        source_path = Path("sources") / f"{source}.json"
+        if not source_path.exists():
+            for candidate in Path("sources").glob("*.json"):
+                if candidate.stem.lower() == source.lower():
+                    source_path = candidate
+                    break
+        if not source_path.exists():
+            return []
+
+        with source_path.open(encoding="utf-8") as fh:
+            entries = json.load(fh)
+        if not isinstance(entries, list):
+            return []
+
+        repo_entry = next(
+            (
+                e for e in entries
+                if isinstance(e, dict)
+                and e.get("repo")
+                and str(e.get("repo")).lower() != "morphe-cli"
+                and str(e.get("provider", "github")).lower() == "github"
+            ),
+            None,
+        )
+        if not repo_entry:
+            return []
+
+        user = str(repo_entry.get("user") or "").strip()
+        repo = str(repo_entry.get("repo") or "").strip()
+        tag = str(repo_entry.get("tag") or "latest").strip()
+        if not user or not repo:
+            return []
+
+        refs = []
+        try:
+            release = detect_release(repo_entry)
+            release_tag = str(release.get("tag_name") or "").strip()
+            if release_tag:
+                refs.append(release_tag)
+        except Exception as exc:
+            logging.debug("Could not resolve patch release tag for %s/%s: %s", user, repo, exc)
+
+        if tag != "latest":
+            refs.append(tag)
+        else:
+            refs.extend(["main", "master"])
+
+        data = None
+        seen_refs = set()
+        for ref in refs:
+            if not ref or ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            try:
+                candidate = fetch_json(
+                    f"https://raw.githubusercontent.com/{user}/{repo}/{quote(ref, safe='')}/patches-list.json"
+                )
+                if isinstance(candidate, (list, dict)):
+                    data = candidate
+                    break
+            except Exception:
+                continue
+
+        if data is None:
+            return []
+
+        declarations: dict[str, list[dict]] = {}
+
+        def walk(node):
+            if isinstance(node, dict):
+                if (
+                    node.get("packageName") == package_name
+                    and isinstance(node.get("targets"), list)
+                ):
+                    package_signatures = [
+                        str(value).strip().lower()
+                        for value in (node.get("signatures") or [])
+                        if str(value).strip()
+                    ]
+                    apk_file_type = str(node.get("apkFileType") or "").strip().upper()
+
+                    for target in node["targets"]:
+                        if not isinstance(target, dict) or not target.get("version"):
+                            continue
+                        version = str(target["version"]).strip()
+                        if not version:
+                            continue
+
+                        item = dict(target)
+                        item["version"] = version
+                        item["signatures"] = package_signatures
+                        item["apk_file_types"] = [apk_file_type] if apk_file_type else []
+                        declarations.setdefault(version, []).append(item)
+
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(data)
+        if not declarations:
+            return []
+
+        raw_targets = []
+        for version, items in declarations.items():
+            # Keep each declaration separate so mixed experimental/stable
+            # declarations remain visible to the existing safety policy.
+            for item in items:
+                raw_targets.append(item)
+
+        targets = select_preferred_patch_targets(raw_targets)
+        _source_supported_targets_cache[cache_key] = list(targets)
+        return list(targets)
+
+    except Exception as exc:
+        logging.debug(
+            "Patch source target lookup failed for %s/%s: %s",
+            source,
+            package_name,
+            exc,
+        )
+        _source_supported_targets_cache[cache_key] = []
+        return []
+
+def _find_aapt2() -> str | None:
+    candidates = []
+    for root in (
+        os.environ.get("ANDROID_HOME"),
+        os.environ.get("ANDROID_SDK_ROOT"),
+        "/usr/local/lib/android/sdk",
+    ):
+        if root:
+            candidates.extend(sorted(Path(root).glob("build-tools/*/aapt2"), reverse=True))
+    return str(candidates[0]) if candidates else shutil.which("aapt2")
+
+
+def _find_apkanalyzer() -> str | None:
+    candidates = []
+    for root in (
+        os.environ.get("ANDROID_HOME"),
+        os.environ.get("ANDROID_SDK_ROOT"),
+        "/usr/local/lib/android/sdk",
+    ):
+        if not root:
+            continue
+        candidates.extend(sorted(
+            Path(root).glob("cmdline-tools/*/bin/apkanalyzer"),
+            reverse=True,
+        ))
+    return str(candidates[0]) if candidates else shutil.which("apkanalyzer")
+
+
+def _find_aapt() -> str | None:
+    candidates = []
+    for root in (
+        os.environ.get("ANDROID_HOME"),
+        os.environ.get("ANDROID_SDK_ROOT"),
+        "/usr/local/lib/android/sdk",
+    ):
+        if root:
+            candidates.extend(sorted(Path(root).glob("build-tools/*/aapt"), reverse=True))
+    return str(candidates[0]) if candidates else shutil.which("aapt")
+
+
+def _artifact_base_apk(path: Path) -> tuple[Path, Path | None]:
+    """Return (APK to inspect, temporary extracted APK if one was needed)."""
+    if path.suffix.lower() not in {".apkm", ".apks", ".xapk", ".zip"}:
+        return path, None
+
+    with zipfile.ZipFile(path) as archive:
+        members = [
+            name for name in archive.namelist()
+            if name.lower().endswith(".apk") and not name.endswith("/")
+        ]
+        if not members:
+            raise ValueError("Bundle contains no APK members")
+
+        members.sort(key=lambda name: (
+            0 if Path(name).name.lower() == "base.apk" else 1,
+            name,
+        ))
+        fd, temp_name = tempfile.mkstemp(prefix="morphe-contract-", suffix=".apk")
+        os.close(fd)
+        temp_path = Path(temp_name)
+        with archive.open(members[0]) as src, temp_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return temp_path, temp_path
+
+
+def _apk_badging(path: Path) -> dict:
+    aapt2 = _find_aapt2()
+    if not aapt2:
+        raise RuntimeError("aapt2 is required for source-contract validation")
+    result = subprocess.run(
+        [aapt2, "dump", "badging", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"aapt2 failed for {path.name}: {(result.stdout or result.stderr).strip()[-1000:]}"
+        )
+    text = result.stdout
+    package = re.search(r"package: name='([^']+)'", text)
+    version_name = re.search(r"versionName='([^']+)'", text)
+    version_code = re.search(r"versionCode='(\d+)'", text)
+    min_sdk = re.search(r"sdkVersion:'(\d+)'", text)
+
+    parsed_min_sdk = int(min_sdk.group(1)) if min_sdk else None
+
+    # Some APKs expose package/version/versionCode through aapt2 but omit
+    # sdkVersion from the badging output. Recover the minimum API level from
+    # the binary AndroidManifest.xml with the SDK's APK Analyzer instead of
+    # guessing or trusting provider metadata.
+    if parsed_min_sdk is None:
+        apkanalyzer = _find_apkanalyzer()
+        if apkanalyzer:
+            result = subprocess.run(
+                [apkanalyzer, "manifest", "min-sdk", str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                match = re.search(r"\b(\d+)\b", (result.stdout or "").strip())
+                if match:
+                    parsed_min_sdk = int(match.group(1))
+
+    # Older Android SDK installations may not have apkanalyzer. Fall back to
+    # the legacy aapt badging parser while remaining strict if neither tool
+    # can verify the value.
+    if parsed_min_sdk is None:
+        aapt = _find_aapt()
+        if aapt:
+            result = subprocess.run(
+                [aapt, "dump", "badging", str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                fallback_match = re.search(
+                    r"sdkVersion:'(\d+)'",
+                    result.stdout or "",
+                )
+                if fallback_match:
+                    parsed_min_sdk = int(fallback_match.group(1))
+
+    return {
+        "package": package.group(1) if package else None,
+        "version": version_name.group(1) if version_name else None,
+        "version_code": int(version_code.group(1)) if version_code else None,
+        "min_sdk": parsed_min_sdk,
+    }
+
+
+def _apk_certificate_digests(path: Path) -> set[str]:
+    apksigner = find_apksigner()
+    if not apksigner:
+        raise RuntimeError("apksigner is required when the source declares signatures")
+    result = subprocess.run(
+        [apksigner, "verify", "--print-certs", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    if result.returncode != 0 and "certificate SHA-256 digest" not in output:
+        raise RuntimeError("apksigner could not read APK certificates")
+    return {
+        match.group(1).replace(":", "").lower()
+        for match in re.finditer(
+            r"certificate SHA-256 digest:\s*([0-9a-fA-F:]+)",
+            output,
+            re.IGNORECASE,
+        )
+    }
+
+
+def validate_source_artifact(
+    path: Path,
+    target: dict,
+    package_name: str,
+    arch: str = "universal",
+    verify_signature: bool = True,
+    verify_sha256: bool = True,
+) -> tuple[bool, list[str]]:
+    """Validate an artifact against the patch source's declared target contract.
+
+    A declared constraint is mandatory. If the source does not declare it,
+    validation does not invent one. Provider fallback must pass this function
+    before Morphe is allowed to patch the artifact.
+    """
+    reasons: list[str] = []
+    temp_path = None
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return False, ["artifact is missing or empty"]
+
+        if not check_apk_integrity(path) and path.suffix.lower() not in {".apkm", ".apks", ".xapk", ".zip"}:
+            reasons.append("standalone APK is not a valid ZIP archive")
+            return False, reasons
+
+        apk_path, temp_path = _artifact_base_apk(path)
+        info = _apk_badging(apk_path)
+
+        if info["package"] != package_name:
+            reasons.append(
+                f"package mismatch: actual={info['package']!r}, expected={package_name!r}"
+            )
+
+        expected_version = str(target.get("version") or "").strip()
+        if expected_version and info["version"] != expected_version:
+            reasons.append(
+                f"version mismatch: actual={info['version']!r}, expected={expected_version!r}"
+            )
+
+        expected_by_arch = target.get("version_codes_by_arch") or {}
+        arch_key = {
+            "arm64-v8a": "ARM64_V8A",
+            "armeabi-v7a": "ARMEABI_V7A",
+            "x86_64": "X86_64",
+            "x86": "X86",
+        }.get((arch or "").lower())
+
+        if arch_key and expected_by_arch.get(arch_key):
+            expected_codes = expected_by_arch[arch_key]
+        else:
+            expected_codes = target.get("version_codes") or []
+
+        if expected_codes:
+            if info["version_code"] not in expected_codes:
+                reasons.append(
+                    f"versionCode mismatch: actual={info['version_code']}, expected={expected_codes}"
+                )
+
+        min_sdk = target.get("min_sdk")
+        if min_sdk is not None and info["min_sdk"] is not None and info["min_sdk"] < int(min_sdk):
+            reasons.append(
+                f"minSdk mismatch: actual={info['min_sdk']}, required>={int(min_sdk)}"
+            )
+        elif min_sdk is not None and info["min_sdk"] is None:
+            reasons.append("minSdk could not be verified")
+
+        allowed_types = {str(v).upper() for v in (target.get("apk_file_types") or [])}
+        if allowed_types:
+            suffix = path.suffix.lower()
+            actual_type = (
+                "APKM" if suffix == ".apkm"
+                else "APKS" if suffix == ".apks"
+                else "XAPK" if suffix == ".xapk"
+                else "APK"
+            )
+            normalized_allowed = set()
+            for value in allowed_types:
+                if value in {"APK", "APK_REQUIRED"}:
+                    normalized_allowed.add("APK")
+                elif value in {"XAPK", "XAPK_REQUIRED"}:
+                    normalized_allowed.add("XAPK")
+                elif value:
+                    normalized_allowed.add(value)
+
+            # Morphe can consume a standalone APK or supported split-bundle
+            # containers. The source's file-type declaration therefore describes
+            # the packaging requirement, not a filename extension requirement:
+            #   APK / APK_REQUIRED  -> APK, APKM, APKS, or XAPK are usable.
+            #   XAPK / XAPK_REQUIRED -> a split bundle is required; APKM/APKS/XAPK
+            #                                are all valid Morphe input containers.
+            # This never relaxes package/version/versionCode/minSdk/ABI/DPI/
+            # signature/SHA-256 validation.
+            bundle_types = {"APKM", "APKS", "XAPK"}
+            type_compatible = (
+                "ANY" in normalized_allowed
+                or actual_type in normalized_allowed
+                or ("APK" in normalized_allowed and actual_type in {"APK", *bundle_types})
+                or ("XAPK" in normalized_allowed and actual_type in bundle_types)
+            )
+            if not type_compatible:
+                reasons.append(
+                    f"artifact type mismatch: actual={actual_type}, source allows={sorted(normalized_allowed)}"
+                )
+
+        signatures = {str(v).replace(":", "").lower() for v in (target.get("signatures") or [])}
+        if signatures and verify_signature:
+            actual_signatures = _apk_certificate_digests(apk_path)
+            if not actual_signatures:
+                reasons.append("source declares signatures but artifact certificate could not be verified")
+            elif not actual_signatures.intersection(signatures):
+                reasons.append(
+                    f"signature mismatch: actual={sorted(actual_signatures)}, expected one of={sorted(signatures)}"
+                )
+
+        hashes = {str(v).replace(":", "").lower() for v in (target.get("sha256") or [])}
+        if hashes and verify_sha256:
+            candidates = {hashlib.sha256(path.read_bytes()).hexdigest()}
+            if apk_path != path:
+                candidates.add(hashlib.sha256(apk_path.read_bytes()).hexdigest())
+            if not candidates.intersection(hashes):
+                reasons.append(
+                    f"SHA-256 mismatch: actual={sorted(candidates)}, expected one of={sorted(hashes)}"
+                )
+
+        return not reasons, reasons
+    except Exception as exc:
+        reasons.append(f"contract validation error: {exc}")
+        return False, reasons
+    finally:
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
+
+
+def get_source_supported_versions(package_name: str, source: str) -> list[str]:
+    """Return automatic build candidates, preferring stable targets."""
+    return [
+        target["version"]
+        for target in get_source_supported_targets(package_name, source)
+    ]
+
+
+def get_source_recommended_version(package_name: str, source: str) -> str:
+    """Return the highest explicitly stable target, or empty when none exists."""
+    stable = [
+        target["version"]
+        for target in get_source_supported_targets(package_name, source)
+        if target.get("is_experimental") is False
+    ]
+    return get_highest_version(stable) or ""
+
+
+def get_source_supported_version_codes(package_name: str, source: str) -> dict[str, list[int]]:
+    """Return version codes for automatic candidates, preferring stable targets."""
+    return {
+        target["version"]: target["version_codes"]
+        for target in get_source_supported_targets(package_name, source)
+    }
+
+def get_supported_version(package_name: str, cli: str, patches: str) -> Optional[str]:
+    """Backwards compatible helper: returns the highest compatible version, if any."""
+    versions = get_supported_versions(package_name, cli, patches)
+    return versions[0] if versions else None
+
+def extract_filename(response, fallback_url=None) -> str:
+    cd = response.headers.get('content-disposition')
+    if cd:
+        _, params = parse_header(cd)
+        filename = params.get('filename') or params.get('filename*')
+        if filename:
+            return unquote(filename)
+
+    parsed = urlparse(response.url)
+    query_params = parse_qs(parsed.query)
+    rcd = query_params.get('response-content-disposition')
+    if rcd:
+        _, params = parse_header(unquote(rcd[0]))
+        filename = params.get('filename') or params.get('filename*')
+        if filename:
+            return unquote(filename)
+
+    path = urlparse(fallback_url or response.url).path
+    return unquote(Path(path).name)
+
+def gh_api_request(endpoint: str) -> dict:
+    """Make a GitHub API request using the 'gh' CLI as it handles tokens more robustly in Actions"""
+    env = os.environ.copy()
+    # Ensure GH_TOKEN is set for the gh cli
+    if "GITHUB_TOKEN" in env and "GH_TOKEN" not in env:
+        env["GH_TOKEN"] = env["GITHUB_TOKEN"]
+        
+    try:
+        result = subprocess.run(
+            ["gh", "api", endpoint],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True
+        )
+        return json.loads(result.stdout)
+    except Exception as e:
+        logging.debug(f"gh api {endpoint} failed: {e}")
+        raise
+
+
+def fetch_json(url: str, headers: dict | None = None) -> dict | list:
+    response = session.get(url, headers=headers or {})
+    response.raise_for_status()
+    return response.json()
+
+
+def normalize_source_entry(entry: dict) -> dict:
+    provider = (entry.get("provider") or "github").lower().strip()
+    tag = (entry.get("tag") or "latest").strip() or "latest"
+
+    if provider in ("github", "codeberg"):
+        user = (entry.get("user") or "").strip()
+        repo = (entry.get("repo") or "").strip()
+        if not user or not repo:
+            raise ValueError(f"{provider} source entries require user and repo")
+        return {
+            "provider": provider,
+            "tag": tag,
+            "user": user,
+            "repo": repo,
+            "identity": f"{user}/{repo}",
+        }
+
+    if provider == "gitlab":
+        project = (entry.get("project") or "").strip()
+        if not project:
+            raise ValueError("gitlab source entries require project")
+        return {
+            "provider": provider,
+            "tag": tag,
+            "project": project,
+            "identity": project,
+        }
+
+    raise ValueError(f"Unsupported source provider: {provider}")
+
+
+def normalize_release(tag_name: str, published_at: str, assets: list[dict]) -> dict:
+    return {
+        "tag_name": tag_name or "?",
+        "published_at": published_at or "?",
+        "assets": [
+            {
+                "name": asset.get("name", ""),
+                "browser_download_url": asset.get("browser_download_url")
+                or asset.get("direct_asset_url")
+                or asset.get("url", ""),
+            }
+            for asset in assets
+            if asset.get("name")
+        ],
+    }
+
+
+def detect_release(entry: dict) -> dict:
+    normalized = normalize_source_entry(entry)
+    provider = normalized["provider"]
+
+    if provider == "github":
+        release = detect_github_release(normalized["user"], normalized["repo"], normalized["tag"])
+        return normalize_release(
+            release.get("tag_name"),
+            release.get("published_at") or release.get("created_at"),
+            release.get("assets") or [],
+        )
+
+    if provider == "gitlab":
+        return detect_gitlab_release(normalized["project"], normalized["tag"])
+
+    if provider == "codeberg":
+        return detect_codeberg_release(normalized["user"], normalized["repo"], normalized["tag"])
+
+    raise ValueError(f"Unsupported source provider: {provider}")
+
+
+def detect_gitlab_release(project: str, tag: str) -> dict:
+    encoded = quote(project, safe="")
+    if tag == "latest":
+        data = fetch_json(f"https://gitlab.com/api/v4/projects/{encoded}/releases/permalink/latest")
+    elif tag in ("", "dev", "prerelease"):
+        releases = fetch_json(f"https://gitlab.com/api/v4/projects/{encoded}/releases")
+        if not isinstance(releases, list) or not releases:
+            raise ValueError(f"No releases found for GitLab project {project}")
+        data = releases[0]
+    else:
+        data = fetch_json(f"https://gitlab.com/api/v4/projects/{encoded}/releases/{quote(tag, safe='')}")
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Unexpected GitLab release response shape for {project}/{tag}")
+    assets = (data.get("assets") or {}).get("links") or []
+    return normalize_release(data.get("tag_name"), data.get("released_at"), assets)
+
+
+def detect_codeberg_release(user: str, repo: str, tag: str) -> dict:
+    base = f"https://codeberg.org/api/v1/repos/{user}/{repo}/releases"
+    if tag == "latest":
+        data = fetch_json(f"{base}/latest")
+    elif tag in ("", "dev", "prerelease"):
+        releases = fetch_json(base)
+        if not isinstance(releases, list) or not releases:
+            raise ValueError(f"No releases found for Codeberg repo {user}/{repo}")
+        data = releases[0]
+    else:
+        data = fetch_json(f"{base}/tags/{quote(tag, safe='')}")
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Unexpected Codeberg release response shape for {user}/{repo}/{tag}")
+    return normalize_release(data.get("tag_name"), data.get("published_at"), data.get("assets") or [])
+
+def detect_github_release(user: str, repo: str, tag: str) -> dict:
+    if tag == "latest":
+        release_lookup = "latest"
+    elif tag in ["", "dev", "prerelease"]:
+        release_lookup = tag or "most recent"
+    else:
+        release_lookup = tag
+
+    # Small sleep to avoid hammering the API and mitigate transient 401s
+    time.sleep(1)
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Prefer 'gh' CLI as it handles tokens more robustly in Actions environment
+            if attempt < 2 and shutil.which("gh"):
+                logging.info(f"Fetching release {tag} for {user}/{repo} (attempt {attempt + 1})...")
+                
+                if tag == "latest":
+                    data = gh_api_request(f"repos/{user}/{repo}/releases/latest")
+                    return data
+                elif tag in ["", "dev", "prerelease"]:
+                    data = gh_api_request(f"repos/{user}/{repo}/releases")
+                    if not isinstance(data, list):
+                        # Handle case where API might return a single object (unlikely for /releases)
+                        data = [data]
+                        
+                    if not data:
+                        raise ValueError(f"No releases found for {user}/{repo}")
+                    
+                    if tag == "":
+                        release = max(data, key=lambda x: x['created_at'])
+                    elif tag == "dev":
+                        devs = [r for r in data if 'dev' in r['tag_name'].lower()]
+                        if not devs:
+                            raise ValueError(f"No dev release found for {user}/{repo}")
+                        release = max(devs, key=lambda x: x['created_at'])
+                    else:
+                        pres = [r for r in data if r['prerelease']]
+                        if not pres:
+                            raise ValueError(f"No prerelease found for {user}/{repo}")
+                        release = max(pres, key=lambda x: x['created_at'])
+                    return release
+                else:
+                    data = gh_api_request(f"repos/{user}/{repo}/releases/tags/{tag}")
+                    return data
+            else:
+                # Fallback to PyGithub
+                logging.warning(f"Falling back to PyGithub for {user}/{repo}...")
+                repo_obj = gh.get_repo(f"{user}/{repo}")
+                if tag == "latest":
+                    release = repo_obj.get_latest_release()
+                    return release.raw_data
+                return repo_obj.get_release(tag).raw_data
+                    
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 3
+                logging.warning(f"Attempt {attempt + 1} failed for {user}/{repo}: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            
+            # Special message for 401 on external repos
+            err_msg = str(e).lower()
+            if "401" in err_msg or "unauthorized" in err_msg or "bad credentials" in err_msg:
+                is_external = user.lower() not in (os.environ.get("GITHUB_REPOSITORY", "").lower())
+                if is_external:
+                    logging.error(
+                        "❌ 401 Unauthorized for external repository %s/%s. "
+                        "The default GITHUB_TOKEN in Actions cannot access private external repositories. "
+                        "If this repo is private, please use a Personal Access Token (PAT) with 'repo' scope "
+                        "stored as a secret (e.g., CUSTOM_GH_TOKEN) and update your workflow.",
+                        user, repo
+                    )
+                raise RuntimeError("Bad GitHub credentials for release lookup") from e
+            
+            logging.error(f"Error fetching release {tag} for {user}/{repo} after {max_retries} attempts: {e}")
+            raise
+
+def detect_source_type(cli_file: Path, patches_file: Path) -> str:
+    """Detect if we're using Morphe or ReVanced based on downloaded files"""
+    if cli_file and "morphe" in cli_file.name.lower() and patches_file and patches_file.suffix == ".mpp":
+        return "morphe"
+    elif cli_file and "revanced" in cli_file.name.lower() and patches_file and patches_file.suffix in [".jar", ".rvp"]:
+        return "revanced"
+    return "unknown"
+
+
+def strip_zip_entries(zip_path: Path, patterns: list[str]) -> None:
+    """Strip matching file patterns from a ZIP archive in a cross-platform way."""
+    if not zip_path or not zip_path.exists():
+        return
+
+    if shutil.which("zip"):
+        try:
+            run_process(["zip", "--delete", str(zip_path)] + patterns, silent=True, check=False)
+            return
+        except Exception:
+            pass
+
+    # Pure Python fallback using zipfile
+    temp_zip = zip_path.with_suffix(".tmp.zip")
+    try:
+        import fnmatch
+        modified = False
+        with zipfile.ZipFile(zip_path, 'r') as zin:
+            with zipfile.ZipFile(temp_zip, 'w', compression=zin.compression) as zout:
+                for item in zin.infolist():
+                    if any(fnmatch.fnmatch(item.filename, p) for p in patterns):
+                        modified = True
+                        continue
+                    zout.writestr(item, zin.read(item.filename))
+        if modified:
+            zip_path.unlink()
+            temp_zip.rename(zip_path)
+        else:
+            temp_zip.unlink(missing_ok=True)
+    except Exception as e:
+        logging.debug(f"Failed to strip zip entries: {e}")
+        if temp_zip.exists():
+            temp_zip.unlink(missing_ok=True)
+
+
+def check_apk_integrity(apk_path: Path) -> bool:
+    """Validate that APK is a valid uncorrupted zip archive."""
+    if not apk_path or not apk_path.exists() or apk_path.stat().st_size == 0:
+        return False
+    try:
+        if not zipfile.is_zipfile(apk_path):
+            return False
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            bad_file = z.testzip()
+            if bad_file is not None:
+                return False
+        return True
+    except Exception:
+        return False
