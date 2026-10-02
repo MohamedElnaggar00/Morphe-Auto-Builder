@@ -1,10 +1,11 @@
+import zipfile
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src import apkmirror, utils
+from src import apkmirror, gplaydl, utils
 
 
 class SourceContractRuntimeTests(unittest.TestCase):
@@ -166,6 +167,72 @@ class SourceContractRuntimeTests(unittest.TestCase):
                 self.assertFalse(valid)
                 self.assertTrue(any("artifact type mismatch" in r for r in reasons))
 
+
+    def test_google_play_merge_allows_xapk_contract_as_standalone_apk(self):
+        calls = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+            base = work_dir / "base.apk"
+            with zipfile.ZipFile(base, "w") as archive:
+                archive.writestr("AndroidManifest.xml", b"placeholder")
+                archive.writestr("lib/arm64-v8a/libexample.so", b"native")
+
+            editor = work_dir / "APKEditor.jar"
+            editor.write_bytes(b"fake")
+
+            def fake_run(command, **kwargs):
+                calls.append(command)
+                merged = Path.cwd() / "com.example.app-merged.apk"
+                with zipfile.ZipFile(merged, "w") as archive:
+                    archive.writestr("lib/arm64-v8a/libexample.so", b"native")
+                return subprocess.CompletedProcess(
+                    args=command, returncode=0, stdout="", stderr=""
+                )
+
+            def fake_validate(*args, **kwargs):
+                self.assertTrue(kwargs.get("allow_merged_play_apk"))
+                return True, []
+
+            try:
+                with patch.dict(
+                    "os.environ",
+                    {"SOURCE": "example", "ARCH": "arm64-v8a"},
+                    clear=False,
+                ), patch(
+                    "src.gplaydl._apk_version_name", return_value="1.0.0"
+                ), patch(
+                    "src.gplaydl._download_apkeditor", return_value=editor
+                ), patch(
+                    "src.gplaydl.subprocess.run", side_effect=fake_run
+                ), patch(
+                    "src.gplaydl.utils.get_source_supported_targets",
+                    return_value=[
+                        {
+                            "version": "1.0.0",
+                            "version_codes": [100],
+                            "min_sdk": 21,
+                            "apk_file_types": ["XAPK_REQUIRED"],
+                        }
+                    ],
+                ), patch(
+                    "src.gplaydl.utils.validate_source_artifact",
+                    side_effect=fake_validate,
+                ), patch(
+                    "src.gplaydl.utils.strip_zip_entries", return_value=None
+                ):
+                    result = gplaydl._merge_play_splits(
+                        [base], work_dir, "com.example.app"
+                    )
+
+                self.assertIsNotNone(result)
+                self.assertTrue(Path(result).exists())
+                self.assertTrue(any(
+                    command[:3] == ["java", "-jar", str(editor)]
+                    for command in calls
+                ))
+            finally:
+                Path("com.example.app-merged.apk").unlink(missing_ok=True)
 
     def test_apkm_is_accepted_when_source_allows_apk(self):
         with tempfile.TemporaryDirectory() as tmp:
