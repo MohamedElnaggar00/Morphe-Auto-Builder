@@ -132,6 +132,41 @@ class SourceContractRuntimeTests(unittest.TestCase):
             self.assertTrue(valid, reasons)
             self.assertEqual(reasons, [])
 
+    def test_merged_google_play_apk_is_accepted_for_xapk_contract_only_when_opted_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "usbhotspot-gplaydl.apk"
+            artifact.write_bytes(b"not-a-real-apk")
+
+            target = {
+                "version": "1.7",
+                "version_codes": [7],
+                "min_sdk": 21,
+                "apk_file_types": ["XAPK_REQUIRED"],
+            }
+
+            with patch("src.utils.check_apk_integrity", return_value=True),                  patch("src.utils._artifact_base_apk", return_value=(artifact, None)),                  patch(
+                     "src.utils._apk_badging",
+                     return_value={
+                         "package": "kha.prog.usbhotspot",
+                         "version": "1.7",
+                         "version_code": 7,
+                         "min_sdk": 21,
+                     },
+                 ):
+                valid, reasons = utils.validate_source_artifact(
+                    artifact, target, "kha.prog.usbhotspot", "arm64-v8a",
+                    allow_merged_play_apk=True,
+                )
+                self.assertTrue(valid, reasons)
+
+                valid, reasons = utils.validate_source_artifact(
+                    artifact, target, "kha.prog.usbhotspot", "arm64-v8a",
+                    allow_merged_play_apk=False,
+                )
+                self.assertFalse(valid)
+                self.assertTrue(any("artifact type mismatch" in r for r in reasons))
+
+
     def test_apkm_is_accepted_when_source_allows_apk(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / "example.apkm"
