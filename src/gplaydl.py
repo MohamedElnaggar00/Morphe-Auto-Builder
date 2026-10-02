@@ -164,6 +164,11 @@ def _merge_play_splits(apks: list[Path], work_dir: Path, package_name: str) -> P
             os.getenv("ARCH", "arm64-v8a"),
             verify_signature=True,
             verify_sha256=True,
+            # Google Play App Bundles arrive as a signed base APK plus compatible
+            # split APKs. This path merges them into a standalone APK immediately
+            # afterward. Permit that packaging transition for this Google Play
+            # path only; all other providers keep the declared artifact contract.
+            allow_merged_play_apk=True,
         )
         if not valid:
             logging.warning(
