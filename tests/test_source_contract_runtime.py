@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src import apkmirror, utils
+from src import apkmirror, gplaydl, utils
 
 
 class SourceContractRuntimeTests(unittest.TestCase):
@@ -166,6 +166,27 @@ class SourceContractRuntimeTests(unittest.TestCase):
                 self.assertFalse(valid)
                 self.assertTrue(any("artifact type mismatch" in r for r in reasons))
 
+
+    def test_google_play_abi_scan_allows_apk_without_native_libraries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "base.apk"
+            with __import__("zipfile").ZipFile(artifact, "w") as archive:
+                archive.writestr("AndroidManifest.xml", b"manifest")
+                archive.writestr("res/values/strings.xml", b"resources")
+
+            self.assertEqual(gplaydl._native_abis(artifact), set())
+
+    def test_google_play_abi_scan_detects_native_abis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "base.apk"
+            with __import__("zipfile").ZipFile(artifact, "w") as archive:
+                archive.writestr("lib/arm64-v8a/libexample.so", b"native")
+                archive.writestr("lib/x86_64/libexample.so", b"native")
+
+            self.assertEqual(
+                gplaydl._native_abis(artifact),
+                {"arm64-v8a", "x86_64"},
+            )
 
     def test_apkm_is_accepted_when_source_allows_apk(self):
         with tempfile.TemporaryDirectory() as tmp:
