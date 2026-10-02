@@ -405,6 +405,11 @@ def run_build(app_name: str, source: str, arch: str = "universal") -> str:
                         arch,
                         verify_signature=not is_gplaydl_artifact,
                         verify_sha256=not is_gplaydl_artifact,
+                        # USB Hotspot's source contract currently declares XAPK,
+                        # but Google Play serves its App Bundle as base + config
+                        # APK splits. gplaydl merges those splits into one APK.
+                        # Keep this exception narrowly scoped to that provider/app.
+                        allow_merged_play_apk=(is_gplaydl_artifact and app_name == "usbhotspot"),
                     )
                     if not valid:
                         logging.warning(
