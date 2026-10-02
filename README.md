@@ -310,8 +310,8 @@ Architecture: arm64-v8a
 - ✅ Use non-personalized search
 - ✅ Show LIVE search
 - ❌ Hide search suggestions
-- ✅ Show the progress bar
 - ✅ Show the progress bar thumbnail
+- ✅ Show the progress bar
 - ❌ Hide already seen videos
 - ❌ Skip content warnings
 - ❌ Share sheet tools
@@ -590,5 +590,23 @@ Architecture: arm64-v8a
 - ❌ GmsCore support (MicroG)
 - ❌ Spoof install source
 - ❌ Spoof app signature
+
+</details>
+
+## Usbhotspot — App v— — Patch v1.22.0
+Patch source: rushi-usbhotspot — v1.22.0 ([v1.22.0](https://github.com/rushiranpise/morphe-patches))
+Architecture: arm64-v8a
+
+<details>
+<summary>🩹 Patches — 1/8 applied</summary>
+
+- ❌ Disable PairIP license check
+- ❌ Provide Original app certificate
+- ❌ Spoof Widevine / DRM level
+- ❌ Fix Firebase after re-signing
+- ❌ GmsCore support (MicroG)
+- ❌ Spoof install source
+- ❌ Spoof app signature
+- ✅ Unlock Pro
 
 </details>
