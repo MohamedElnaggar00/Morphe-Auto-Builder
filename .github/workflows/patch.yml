@@ -3,16 +3,16 @@ name: Auto Build and Release Morphe
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-on:
-  workflow_dispatch:
-    inputs:
-      force_full_rebuild:
-        description: "Rebuild every app (ignore incremental check)"
-        type: boolean
-        required: false
-        default: false
-  schedule:
-    - cron: '0 6 * * *' # Daily at 6:00 AM UTC
+#on:
+  #workflow_dispatch:
+    #inputs:
+      #force_full_rebuild:
+        #description: "Rebuild every app (ignore incremental check)"
+        #type: boolean
+        #required: false
+        #default: false
+  #schedule:
+    #- cron: '0 6 * * *' # Daily at 6:00 AM UTC
 
 jobs:
   download-tools:
